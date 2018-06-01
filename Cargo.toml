@@ -4,3 +4,7 @@ version = "0.1.0"
 authors = ["Rayhaan Jaufeerally <rayhaan+github@rayhaan.ch>"]
 
 [dependencies]
+"libc" = "*"
+
+[build-dependencies]
+bindgen = "0.37.0"
