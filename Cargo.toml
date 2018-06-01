@@ -1,0 +1,6 @@
+[package]
+name = "nat64"
+version = "0.1.0"
+authors = ["Rayhaan Jaufeerally <rayhaan+github@rayhaan.ch>"]
+
+[dependencies]
