@@ -7,39 +7,87 @@ extern crate libc;
 
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::path::Path;
 use libc::{close, ioctl};
 use std::os::unix::prelude::AsRawFd;
+use std::os::unix::io::RawFd;
 use std::io;
 use std::io::Read;
+use std::error::Error;
 
 const TUN_PATH: &'static str = "/dev/net/tun";
 const TUN_MTU: usize = 1500;
 
+pub struct InterfaceName {
+    name: [i8; 16],
+}
+
+impl InterfaceName {
+    fn ifname(s: &[u8]) -> Option<[u8; 16]> {
+        if s.len() > 16 {
+            return None;
+        } else {
+            let mut res = [0u8; 16];
+            res[..s.len()].copy_from_slice(s);
+            return Some(res);
+        }
+    }
+
+    fn new(name: String) -> Result<Self, String> {
+        let c = match CString::new(name) {
+            Err(reason) => return Err(String::from(reason.description())),
+            Ok(c) => c,
+        };
+        let b = match InterfaceName::ifname(c.as_bytes_with_nul()) {
+            None => return Err(String::from("Interface name too long")),
+            Some(b) => b,
+        };
+        Ok(InterfaceName {
+            name: unsafe { std::mem::transmute::<[u8; 16], [i8; 16]>(b) },
+        })
+    }
+}
+
+pub struct OwnedFd {
+    fd: RawFd,
+}
+
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        unsafe { close(self.fd) };
+    }
+}
+
 // TunnelIface represents a TUN interface.
 pub struct TunnelIface {
     dev: File,
-    sock: libc::c_int,
+    sock: OwnedFd,
     ifidx: libc::c_int,
-    if_name: [i8; 16],
+    if_name: InterfaceName,
 }
 
 impl TunnelIface {
-    fn create_iface(name: [i8; 16], fd: std::os::unix::io::RawFd) -> libc::c_int {
+    unsafe fn create_iface(name: [i8; 16], fd: std::os::unix::io::RawFd) -> Result<(), String> {
         let mut ifr: ifreq = ifreq {
             ifr_ifrn: ifreq__bindgen_ty_1 { ifrn_name: name },
             ifr_ifru: ifreq__bindgen_ty_2 {
                 ifru_flags: IFF_TUN as i16,
             },
         };
-        unsafe { ioctl(fd, CONST_TUNSETIFF, &mut ifr) }
+        if ioctl(fd, CONST_TUNSETIFF, &mut ifr) < 0 {
+            return Err(format!("failed to create tunnel interface: {}",
+                io::Error::last_os_error()));
+        }
+        Ok(())
     }
 
-    // Create a socket that can send / recieve packets from the tunnel interface.
+    // Open a socket to configure the TUN interface.
     // Returns (socket on the tunnel interface, interface index).
-    unsafe fn create_sock(name: [i8; 16]) -> Result<(libc::c_int, libc::c_int), String> {
-        let sock = libc::socket(AF_PACKET as i32, __socket_type_SOCK_DGRAM as i32, 0);
-        if sock < 0 {
+    fn create_sock(name: [i8; 16]) -> Result<(OwnedFd, libc::c_int), String> {
+        let sock: OwnedFd = OwnedFd {
+            fd: unsafe { libc::socket(AF_PACKET as i32, __socket_type_SOCK_DGRAM as i32, 0) }
+                as RawFd,
+        };
+        if sock.fd < 0 {
             return Err(String::from(format!(
                 "failed to create AF_PACKET socket: {}",
                 io::Error::last_os_error()
@@ -51,48 +99,48 @@ impl TunnelIface {
                 ifru_ivalue: 0 as i32,
             },
         };
-        let res = ioctl(sock, SIOCGIFINDEX as u64, &mut req);
+        let res = unsafe { ioctl(sock.fd, SIOCGIFINDEX as u64, &mut req) };
         if res < 0 {
-            close(sock);
             return Err(String::from(format!(
                 "failed to get interface index: {}",
                 io::Error::last_os_error()
             )));
         }
 
-        return Ok((sock, req.ifr_ifru.ifru_ivalue));
+        return Ok((sock, unsafe { req.ifr_ifru.ifru_ivalue }));
     }
 
-    fn ifup(&self) -> Result<libc::c_int, String> {
+    fn ifup(&self) -> Result<(), String> {
         // Check if the interface is already up.
         let mut ifr: ifreq = ifreq {
-            ifr_ifrn: ifreq__bindgen_ty_1 { ifrn_name: self.if_name },
-            ifr_ifru: ifreq__bindgen_ty_2 {
-                ifru_flags: 0,
+            ifr_ifrn: ifreq__bindgen_ty_1 {
+                ifrn_name: self.if_name.name,
             },
+            ifr_ifru: ifreq__bindgen_ty_2 { ifru_flags: 0 },
         };
-        if unsafe { ioctl(self.sock, CONST_SIOCSIFFLAGS, &mut ifr) } < 0 {
-            return Err(String::from(format!("failed getting flags for interface: {}", io::Error::last_os_error())));
+        if unsafe { ioctl(self.sock.fd, CONST_SIOCSIFFLAGS, &mut ifr) } < 0 {
+            return Err(String::from(format!(
+                "failed getting flags for interface: {}",
+                io::Error::last_os_error()
+            )));
         }
         if unsafe { (ifr.ifr_ifru.ifru_flags & IFF_UP as i16 & IFF_RUNNING as i16) } != 0 {
-            return Ok(0);
+            return Ok(()); // Early return if the interface is already up.
         }
         // Set the interface state to up.
-        unsafe { ifr.ifr_ifru.ifru_flags |= IFF_UP as i16 | IFF_RUNNING as i16 } ;
-        if unsafe { ioctl(self.sock, CONST_SIOCSIFFLAGS, &mut ifr) } < 0 {
-            return Err(String::from(format!("failed setting flags on interface: {}", io::Error::last_os_error())));
+        unsafe { ifr.ifr_ifru.ifru_flags |= IFF_UP as i16 | IFF_RUNNING as i16 };
+        if unsafe { ioctl(self.sock.fd, CONST_SIOCSIFFLAGS, &mut ifr) } < 0 {
+            return Err(String::from(format!(
+                "failed setting flags on interface: {}",
+                io::Error::last_os_error()
+            )));
         }
-        Ok(0)
+        Ok(())
     }
 
-    pub fn new(name: &str) -> Result<Self, String> {
-        let name = CString::new(name).unwrap();
-        let n: [i8; 16] = unsafe {
-            std::mem::transmute::<[u8; 16], [i8; 16]>(ifname(name.to_bytes_with_nul()).unwrap())
-        };
-
-        let path = Path::new(TUN_PATH);
-        let dev = match OpenOptions::new().read(true).write(true).open(&path) {
+    pub fn new(name: String) -> Result<Self, String> {
+        let name = InterfaceName::new(name).unwrap();
+        let dev = match OpenOptions::new().read(true).write(true).open(TUN_PATH) {
             Err(reason) => {
                 return Err(String::from(format!(
                     "failed to open {}: {}",
@@ -103,52 +151,34 @@ impl TunnelIface {
         };
 
         // Create the interface.
-        if TunnelIface::create_iface(n, dev.as_raw_fd()) < 0 {
-            return Err(String::from(format!(
-                "failed to create tun interface: {}",
-                io::Error::last_os_error()
-            )));
-        }
+        unsafe { TunnelIface::create_iface(name.name, dev.as_raw_fd())?; }
 
-        // Create a socket.
-        let (sock, ifidx) = match unsafe { TunnelIface::create_sock(n) } {
+        // Create a control socket.
+        let (sock, ifidx) = match TunnelIface::create_sock(name.name) {
             Err(reason) => return Err(String::from(format!("failed to create socket: {}", reason))),
             Ok((sock, ifidx)) => (sock, ifidx),
         };
 
-        return Ok(TunnelIface {
+        Ok(TunnelIface {
             dev: dev,
-            if_name: n,
+            if_name: name,
             sock: sock,
             ifidx: ifidx,
-        });
-    }
-}
-
-fn ifname(s: &[u8]) -> Option<[u8; 16]> {
-    if s.len() > 16 {
-        return None;
-    } else {
-        let mut res = [0u8; 16];
-        for i in 0..s.len() {
-            res[i] = s[i];
-        }
-        return Some(res);
+        })
     }
 }
 
 fn main() {
-    let mut tif: TunnelIface = TunnelIface::new("tayl0r").unwrap();
+    let mut tif: TunnelIface = TunnelIface::new(String::from("tayl0r")).unwrap();
     tif.ifup().unwrap();
 
-    let mut buf: [u8; 1500] = [0; 1500];
+    let mut buf: [u8; 1600] = [0; 1600];
     loop {
         let len = tif.dev.read(&mut buf).unwrap();
         println!("read packet of len {}:", len);
-        for c in buf.iter() {
+        for c in buf[2..len].iter() {
             print!("{:X} ", c);
         }
         print!("\n\n");
     }
-
 }

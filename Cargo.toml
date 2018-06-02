@@ -4,7 +4,10 @@ version = "0.1.0"
 authors = ["Rayhaan Jaufeerally <rayhaan+github@rayhaan.ch>"]
 
 [dependencies]
-"libc" = "*"
+"libc" = "0.2.41"
+
+[dependencies.pnet]
+version = "0.21.0"
 
 [build-dependencies]
 bindgen = "0.37.0"
