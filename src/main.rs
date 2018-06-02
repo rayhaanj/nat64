@@ -4,6 +4,7 @@
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 extern crate libc;
+extern crate pnet_packet;
 
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -53,7 +54,9 @@ pub struct OwnedFd {
 
 impl Drop for OwnedFd {
     fn drop(&mut self) {
-        unsafe { close(self.fd) };
+        if unsafe { close(self.fd) } < 0 {
+            print!("Error closing file descriptor: {}", io::Error::last_os_error());
+        }
     }
 }
 
@@ -61,7 +64,7 @@ impl Drop for OwnedFd {
 pub struct TunnelIface {
     dev: File,
     sock: OwnedFd,
-    ifidx: libc::c_int,
+    ifidx: libc::c_int, // interface index.
     if_name: InterfaceName,
 }
 
@@ -168,6 +171,8 @@ impl TunnelIface {
     }
 }
 
+
+
 fn main() {
     let mut tif: TunnelIface = TunnelIface::new(String::from("tayl0r")).unwrap();
     tif.ifup().unwrap();
@@ -175,10 +180,13 @@ fn main() {
     let mut buf: [u8; 1600] = [0; 1600];
     loop {
         let len = tif.dev.read(&mut buf).unwrap();
-        println!("read packet of len {}:", len);
-        for c in buf[2..len].iter() {
-            print!("{:X} ", c);
+        // Try to parse the packet.
+        if buf[4] == 0x60 {
+            let ip6_pkt = pnet_packet::ipv6::Ipv6Packet::new(&buf[4..len]).unwrap();
+            println!("from: {}, to: {}", ip6_pkt.get_source(), ip6_pkt.get_destination());
+        } else if buf[4] == 0x40 {
+            let ip4_pkt = pnet_packet::ipv4::Ipv4Packet::new(&buf[4..len]).unwrap();
+            println!("from {}, to {}", ip4_pkt.get_source(), ip4_pkt.get_destination());
         }
-        print!("\n\n");
     }
 }
