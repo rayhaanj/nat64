@@ -2,6 +2,7 @@ extern crate ipnetwork;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
+use std::collections::{HashSet, HashMap};
 
 fn u8_to_u16(a: u8, b: u8) -> u16 {
     (a as u16) << 8 | b as u16
@@ -11,18 +12,25 @@ enum PrefixLen {
     p32, p40, p48, p56, p64, p96,
 }
 
-// StatelessNat64 implements a translator mechanism which does not keep state.
-pub struct StatelessNat64 {
+// HMNat64 implements a Host Mapped NAT64, which only records mappings between hosts
+// and their corresponding v4 addresses. This is a compromise between complete
+// statelessness where machines on the v6 side need special addresses and a fully
+// stateful NAT which needs to keep per flow state.
+pub struct HMNat64 {
     n64_prefix: ipnetwork::Ipv6Network,
     pfx_len: PrefixLen,
+    ip4_range: ipnetwork::Ipv4Network,
+
+    // Stores a mapping of v6 side client to v4 source address.
+    xlat_table: HashMap<Ipv6Addr, Ipv4Addr>,
+    used_v4: HashSet<Ipv4Addr>,
 }
 
-impl StatelessNat64 {
-
-    fn new(prefix: &str) -> Result<Self, String> {
-        let p = match ipnetwork::Ipv6Network::from_str(prefix) {
+impl HMNat64 {
+    fn new(v6_prefix: &str, v4_range: &str) -> Result<Self, String> {
+        let p = match ipnetwork::Ipv6Network::from_str(v6_prefix) {
             Err(reason) => return Err(format!("failed to parse prefix: {}", reason)),
-            Ok(ipnet) => ipnet,
+            Ok(ip6net) => ip6net,
         };
 
         let pfx_len: PrefixLen = match p.prefix() {
@@ -35,10 +43,44 @@ impl StatelessNat64 {
             _ => return Err(format!("invalid prefix length: {}, must be one of 32, 40, 48, 56, 64, or 96", p.prefix())),
         };
 
-        Ok(StatelessNat64{
+        let v4 = match ipnetwork::Ipv4Network::from_str(v4_range) {
+            Err(reason) => return Err(format!("failed to parse prefix: {}", reason)),
+            Ok(ip4net) => ip4net,
+        };
+
+        Ok(HMNat64{
             n64_prefix: p,
             pfx_len: pfx_len,
+            ip4_range: v4,
+            xlat_table: HashMap::new(),
+            used_v4: HashSet::new(),
         })
+    }
+
+    // is_to_prefix returns true if the destination address is to the translation
+    // range serviced by this XLAT.
+    fn is_to_prefix(&self, dest: Ipv6Addr) -> bool {
+        self.n64_prefix.contains(dest)
+    }
+
+    // get_v4addr_for_host returns an ipv4 address to use as the source address
+    // for communications from a given IPv6 host.
+    fn get_v4addr_for_host(&mut self, src: Ipv6Addr) -> Result<Ipv4Addr, String> {
+        match self.xlat_table.get(&src) {
+            Some(v6addr) => return Ok(*v6addr),
+            None => {} // fallthrough.
+        }
+        // Need to get a new address out of the v4 pool.
+        match self.ip4_range.nth((self.used_v4.len() +1) as u32) {
+            Some(v4addr) => {
+                self.xlat_table.insert(src, v4addr);
+                self.used_v4.insert(v4addr);
+                return Ok(v4addr);
+            }
+            None => {
+                return Err(String::from("ipv4 address space depleted!"))
+            }
+        }
     }
 
     // v4_to_v6 embeds the IPv4 address into the IPv6 prefix.
@@ -155,6 +197,43 @@ mod tests {
     }
 
     #[test]
+    fn test_addr_range() {
+        let ipv6_subnet = ipnetwork::Ipv6Network::from_str("2001:db8::abc0/124").unwrap();
+        let suffixes = vec!['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
+        let mut idx = 0;
+        for addr in ipv6_subnet.iter() {
+            let expected_address = ipnetwork::Ipv6Network::from_str(&format!("2001:db8::abc{}/128", suffixes[idx])).unwrap().network();
+            idx += 1;
+            assert_eq!(addr, expected_address);
+        }
+        assert_eq!(idx, 16);
+    }
+
+    #[test]
+    fn test_addr_mappping() {
+        let mut xlat =  HMNat64::new("64:ff9b::/96", "10.0.0.0/28").unwrap();
+        let ipv6_subnet = ipnetwork::Ipv6Network::from_str("2001:db8::abc0/124").unwrap();
+        let ipv4_subnet = ipnetwork::Ipv4Network::from_str("10.0.0.0/28").unwrap();
+        let mut idx = 0;
+        for addr in ipv6_subnet.iter() {
+            if idx == 0 {
+                idx += 1;
+                continue; // Skip the network address 2001:db8::abc0/128.
+            }
+            println!("v6 address: {}", addr);
+            let xlated = xlat.get_v4addr_for_host(addr).unwrap();
+            let expected = ipv4_subnet.nth(idx).unwrap();
+            idx += 1;
+            assert_eq!(xlated, expected);
+        }
+        assert_eq!(idx, 16);
+        match xlat.get_v4addr_for_host(Ipv6Addr::new(0x2001, 0xdb8, 0xcafe, 0xbabe, 0, 0, 0, 0)) {
+            Ok(r) => panic!(format!("expected ipv4 depletion error but got Ok({})", r)),
+            Err(_) => {},
+        }
+    }
+
+    #[test]
     fn test_translate() {
         let tests = vec![
             TranslateTestCase{
@@ -208,8 +287,9 @@ mod tests {
                 n64_prefix: "2001:db8:122:344::/96",
             },
         ];
+        let client_subnet = "10.0.0.0/24";
         for test in tests {
-            let translator = StatelessNat64::new(test.n64_prefix).unwrap();
+            let translator = HMNat64::new(test.n64_prefix, client_subnet).unwrap();
             assert_eq!(test.ipv6, translator.v4_to_v6(test.ipv4));
             assert_eq!(test.ipv4, translator.v6_to_v4(test.ipv6));
         }
