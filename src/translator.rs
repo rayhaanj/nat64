@@ -214,19 +214,14 @@ mod tests {
         let mut xlat =  HMNat64::new("64:ff9b::/96", "10.0.0.0/28").unwrap();
         let ipv6_subnet = ipnetwork::Ipv6Network::from_str("2001:db8::abc0/124").unwrap();
         let ipv4_subnet = ipnetwork::Ipv4Network::from_str("10.0.0.0/28").unwrap();
-        let mut idx = 0;
-        for addr in ipv6_subnet.iter() {
-            if idx == 0 {
-                idx += 1;
+        for (i, addr) in ipv6_subnet.iter().enumerate() {
+            if i == 0 {
                 continue; // Skip the network address 2001:db8::abc0/128.
             }
-            println!("v6 address: {}", addr);
             let xlated = xlat.get_v4addr_for_host(addr).unwrap();
-            let expected = ipv4_subnet.nth(idx).unwrap();
-            idx += 1;
+            let expected = ipv4_subnet.nth(i as u32).unwrap();
             assert_eq!(xlated, expected);
         }
-        assert_eq!(idx, 16);
         match xlat.get_v4addr_for_host(Ipv6Addr::new(0x2001, 0xdb8, 0xcafe, 0xbabe, 0, 0, 0, 0)) {
             Ok(r) => panic!(format!("expected ipv4 depletion error but got Ok({})", r)),
             Err(_) => {},
