@@ -14,6 +14,12 @@ use std::os::unix::io::RawFd;
 use std::io;
 use std::io::Read;
 use std::error::Error;
+use std::io::Write;
+use pnet_packet::Packet;
+use pnet_packet::PacketSize;
+use std::thread;
+
+mod translator;
 
 const TUN_PATH: &'static str = "/dev/net/tun";
 const TUN_MTU: usize = 1500;
@@ -171,19 +177,35 @@ impl TunnelIface {
     }
 }
 
-
-
 fn main() {
     let mut tif: TunnelIface = TunnelIface::new(String::from("tayl0r")).unwrap();
     tif.ifup().unwrap();
+
+    let mut xlator = translator::HMNat64::new("64:ff9b::/96", "10.1.2.0/24").unwrap();
 
     let mut buf: [u8; 1600] = [0; 1600];
     loop {
         let len = tif.dev.read(&mut buf).unwrap();
         // Try to parse the packet.
         if buf[4] == 0x60 {
-            let ip6_pkt = pnet_packet::ipv6::Ipv6Packet::new(&buf[4..len]).unwrap();
+            let mut ip6_pkt = pnet_packet::ipv6::MutableIpv6Packet::new(&mut buf[4..len]).unwrap();
             println!("from: {}, to: {}", ip6_pkt.get_source(), ip6_pkt.get_destination());
+            if !xlator.is_to_prefix(ip6_pkt.get_destination()) {
+                println!("skipping");
+                continue;
+            }
+            let mut buf: [u8;1500] = [0u8; 1500];
+            let out_pkt = match xlator.process_v6(&mut ip6_pkt, &mut buf).map_err(|e| format!("error: {:?}", e)) {
+                Err(reason) => { println!("err: {:?}", reason); continue; },
+                Ok(pkt) => pkt,
+            };
+            let pkt_len = out_pkt.packet_size();
+            println!("to write: {:?}", &(out_pkt.packet()[..pkt_len]));
+            let mut merged = Vec::new();
+            merged.extend_from_slice(&[0u8; 4]);
+            merged.extend_from_slice(&out_pkt.packet()[..pkt_len]);
+            let len = tif.dev.write(&merged);
+            println!("written {:?} bytes to dev", len);
         } else if buf[4] == 0x40 {
             let ip4_pkt = pnet_packet::ipv4::Ipv4Packet::new(&buf[4..len]).unwrap();
             println!("from {}, to {}", ip4_pkt.get_source(), ip4_pkt.get_destination());
