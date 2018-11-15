@@ -188,12 +188,14 @@ fn main() {
         let len = tif.dev.read(&mut buf).unwrap();
         // Try to parse the packet.
         if buf[4] == 0x60 {
+            // IPv6 packet in.
             let mut ip6_pkt = pnet_packet::ipv6::MutableIpv6Packet::new(&mut buf[4..len]).unwrap();
             println!("from: {}, to: {}", ip6_pkt.get_source(), ip6_pkt.get_destination());
             if !xlator.is_to_prefix(ip6_pkt.get_destination()) {
                 println!("skipping");
                 continue;
             }
+            // FIXME: 1500 byte buffer.
             let mut buf: [u8;1500] = [0u8; 1500];
             let out_pkt = match xlator.process_v6(&mut ip6_pkt, &mut buf).map_err(|e| format!("error: {:?}", e)) {
                 Err(reason) => { println!("err: {:?}", reason); continue; },
@@ -207,6 +209,7 @@ fn main() {
             let len = tif.dev.write(&merged);
             println!("written {:?} bytes to dev", len);
         } else if buf[4] == 0x40 {
+            // IPv4 packet in.
             let ip4_pkt = pnet_packet::ipv4::Ipv4Packet::new(&buf[4..len]).unwrap();
             println!("from {}, to {}", ip4_pkt.get_source(), ip4_pkt.get_destination());
         }

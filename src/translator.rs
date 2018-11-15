@@ -95,7 +95,7 @@ impl HMNat64 {
         let mut response: MutableIpv4Packet<'p> = pnet_packet::ipv4::MutableIpv4Packet::new(buf).unwrap();
         let v4src: Ipv4Addr = self.get_v4addr_for_host(pkt.get_source()).map_err(|e| Xlat6to4Error::Other(e))?;
         let v4dst: Ipv4Addr = self.v6_to_v4(pkt.get_destination());
-        let total_v4_length = 20 + pkt.get_payload_length();
+        let total_v4_length = 20 + pkt.get_payload_length(); // FIXME: use the IHL from the input packet instead of 20.
 
         response.set_version(4);
         response.set_header_length(5);
@@ -121,10 +121,8 @@ impl HMNat64 {
             ip::IpNextHeaderProtocols::Icmpv6 => {
                 let old_payload = Icmpv6Packet::new(pkt.payload()).unwrap();
                 let new_payload = HMNat64::icmp6_to_icmp4(&old_payload)?;
-                println!("content of old ICMP packet: {:?}", old_payload.packet());
-                println!("content of new ICMP packet: {:?}", &new_payload.packet());
                 response.set_payload(&new_payload.packet());
-                response.set_total_length(20 + new_payload.packet().len() as u16);
+                response.set_total_length(total_v4_length + new_payload.packet().len() as u16);
             },
             ip::IpNextHeaderProtocols::Tcp => {
                 let mut tcp_pkt = tcp::MutableTcpPacket::new(pkt.payload_mut()).unwrap();
@@ -136,9 +134,16 @@ impl HMNat64 {
                 response.set_payload(tcp_pkt.packet());
             },
             ip::IpNextHeaderProtocols::Udp => {
-                // ...
+                let mut udp_pkt = udp::MutableUdpPacket::new(pkt.payload_mut()).unwrap();
+                let sum = pnet_packet::udp::ipv4_checksum_adv(&udp_pkt.to_immutable(),
+                                                              &[0u8; 0],
+                                                              &v4src,
+                                                              &v4dst);
+                udp_pkt.set_checksum(sum);
+                response.set_payload(udp_pkt.packet());
             },
             _ => {
+                // If the protocol is unknown leave the inner payload alone.
                 response.set_payload(pkt.payload());
             },
         }
@@ -149,13 +154,12 @@ impl HMNat64 {
         let sum = ipv4::checksum(&response.to_immutable());
         response.set_checksum(sum);
 
-        println!("response: {:?}", response.packet());
         Ok(response.consume_to_immutable())
     }
 
     fn icmp6_to_icmp4<'p>(pkt: &Icmpv6Packet) -> Result<IcmpPacket<'p>, Xlat6to4Error> {
         // XXX setting length via hack, probably reuse some buffer instead of this vodoo.
-        let mut v = vec![0u8; 4 + pkt.payload().len()];
+        let v = vec![0u8; 4 + pkt.payload().len()];
         let mut result = MutableIcmpPacket::owned(v).unwrap();
 
         match pkt.get_icmpv6_type() {
