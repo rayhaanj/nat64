@@ -7,6 +7,7 @@ authors = ["Rayhaan Jaufeerally <rayhaan+github@rayhaan.ch>"]
 "libc" = "0.2.41"
 "pnet_packet" = "0.21.0"
 "ipnetwork" = "0.13.0"
+"pnetlink" = "0.0.3"
 
 [dependencies.pnet]
 version = "0.21.0"

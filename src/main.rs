@@ -1,10 +1,12 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+#![allow(dead_code)]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 extern crate libc;
 extern crate pnet_packet;
+extern crate pnetlink;
 
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -17,12 +19,10 @@ use std::error::Error;
 use std::io::Write;
 use pnet_packet::Packet;
 use pnet_packet::PacketSize;
-use std::thread;
 
 mod translator;
 
 const TUN_PATH: &'static str = "/dev/net/tun";
-const TUN_MTU: usize = 1500;
 
 pub struct InterfaceName {
     name: [i8; 16],
@@ -70,7 +70,6 @@ impl Drop for OwnedFd {
 pub struct TunnelIface {
     dev: File,
     sock: OwnedFd,
-    ifidx: libc::c_int, // interface index.
     if_name: InterfaceName,
 }
 
@@ -163,7 +162,7 @@ impl TunnelIface {
         unsafe { TunnelIface::create_iface(name.name, dev.as_raw_fd())?; }
 
         // Create a control socket.
-        let (sock, ifidx) = match TunnelIface::create_sock(name.name) {
+        let (sock, _) = match TunnelIface::create_sock(name.name) {
             Err(reason) => return Err(String::from(format!("failed to create socket: {}", reason))),
             Ok((sock, ifidx)) => (sock, ifidx),
         };
@@ -172,7 +171,6 @@ impl TunnelIface {
             dev: dev,
             if_name: name,
             sock: sock,
-            ifidx: ifidx,
         })
     }
 }
