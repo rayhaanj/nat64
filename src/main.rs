@@ -8,17 +8,17 @@ extern crate libc;
 extern crate pnet_packet;
 extern crate pnetlink;
 
-use std::ffi::CString;
-use std::fs::{File, OpenOptions};
 use libc::{close, ioctl};
-use std::os::unix::prelude::AsRawFd;
-use std::os::unix::io::RawFd;
-use std::io;
-use std::io::Read;
-use std::error::Error;
-use std::io::Write;
 use pnet_packet::Packet;
 use pnet_packet::PacketSize;
+use std::error::Error;
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::io::Read;
+use std::io::Write;
+use std::os::unix::io::RawFd;
+use std::os::unix::prelude::AsRawFd;
 
 mod translator;
 
@@ -61,7 +61,10 @@ pub struct OwnedFd {
 impl Drop for OwnedFd {
     fn drop(&mut self) {
         if unsafe { close(self.fd) } < 0 {
-            print!("Error closing file descriptor: {}", io::Error::last_os_error());
+            print!(
+                "Error closing file descriptor: {}",
+                io::Error::last_os_error()
+            );
         }
     }
 }
@@ -82,8 +85,10 @@ impl TunnelIface {
             },
         };
         if ioctl(fd, CONST_TUNSETIFF, &mut ifr) < 0 {
-            return Err(format!("failed to create tunnel interface: {}",
-                io::Error::last_os_error()));
+            return Err(format!(
+                "failed to create tunnel interface: {}",
+                io::Error::last_os_error()
+            ));
         }
         Ok(())
     }
@@ -153,13 +158,15 @@ impl TunnelIface {
                 return Err(String::from(format!(
                     "failed to open {}: {}",
                     TUN_PATH, reason
-                )))
+                )));
             }
             Ok(dev) => dev,
         };
 
         // Create the interface.
-        unsafe { TunnelIface::create_iface(name.name, dev.as_raw_fd())?; }
+        unsafe {
+            TunnelIface::create_iface(name.name, dev.as_raw_fd())?;
+        }
 
         // Create a control socket.
         let (sock, _) = match TunnelIface::create_sock(name.name) {
@@ -188,15 +195,25 @@ fn main() {
         if buf[4] == 0x60 {
             // IPv6 packet in.
             let mut ip6_pkt = pnet_packet::ipv6::MutableIpv6Packet::new(&mut buf[4..len]).unwrap();
-            println!("from: {}, to: {}", ip6_pkt.get_source(), ip6_pkt.get_destination());
+            println!(
+                "from: {}, to: {}",
+                ip6_pkt.get_source(),
+                ip6_pkt.get_destination()
+            );
             if !xlator.is_to_prefix(ip6_pkt.get_destination()) {
                 println!("skipping");
                 continue;
             }
             // FIXME: 1500 byte buffer.
-            let mut buf: [u8;1500] = [0u8; 1500];
-            let out_pkt = match xlator.process_v6(&mut ip6_pkt, &mut buf).map_err(|e| format!("error: {:?}", e)) {
-                Err(reason) => { println!("err: {:?}", reason); continue; },
+            let mut buf: [u8; 1500] = [0u8; 1500];
+            let out_pkt = match xlator
+                .process_v6(&mut ip6_pkt, &mut buf)
+                .map_err(|e| format!("error: {:?}", e))
+            {
+                Err(reason) => {
+                    println!("err: {:?}", reason);
+                    continue;
+                }
                 Ok(pkt) => pkt,
             };
             let pkt_len = out_pkt.packet_size();
@@ -209,7 +226,11 @@ fn main() {
         } else if buf[4] == 0x40 {
             // IPv4 packet in.
             let ip4_pkt = pnet_packet::ipv4::Ipv4Packet::new(&buf[4..len]).unwrap();
-            println!("from {}, to {}", ip4_pkt.get_source(), ip4_pkt.get_destination());
+            println!(
+                "from {}, to {}",
+                ip4_pkt.get_source(),
+                ip4_pkt.get_destination()
+            );
         }
     }
 }
