@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 extern crate ipnetwork;
 extern crate pnet_packet;
 
@@ -13,6 +14,7 @@ use translator::pnet_packet::ip::IpNextHeaderProtocol;
 use translator::pnet_packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use translator::pnet_packet::ipv6::MutableIpv6Packet;
 use translator::pnet_packet::MutablePacket;
+use translator::pnet_packet::tcp::{MutableTcpPacket};
 use translator::pnet_packet::{icmp, icmpv6, ip, ipv4, tcp, udp, Packet};
 
 #[derive(Debug)]
@@ -165,13 +167,6 @@ impl HMNat64 {
 
         response.set_source(v4src);
         response.set_destination(v4dst);
-        println!(
-            "out: src={:?}, dst={:?}, in len: {}, out len: {}",
-            v4src,
-            v4dst,
-            pkt.packet().len(),
-            response.packet().len()
-        );
         let sum = ipv4::checksum(&response.to_immutable());
         response.set_checksum(sum);
         Ok(response.consume_to_immutable())
@@ -534,6 +529,36 @@ mod tests {
         Box::new(icmpv6Pkt.packet().to_vec())
     }
 
+    #[derive(Debug)]
+    enum AddrPair {
+        Ipv4(Ipv4Addr, Ipv4Addr),
+        Ipv6(Ipv6Addr, Ipv6Addr),
+    }
+
+    fn tmpl_tcp(
+        ip_pair: AddrPair,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8]
+    ) -> Box<Vec<u8>> {
+        let buf = vec![0u8; 24 + payload.len()];
+        let mut tcp_pkt = MutableTcpPacket::owned(buf).unwrap();
+        tcp_pkt.set_source(src_port);
+        tcp_pkt.set_destination(dst_port);
+        tcp_pkt.set_payload(payload);
+        match ip_pair {
+            AddrPair::Ipv4(src, dst) => {
+                let checksum: u16 = tcp::ipv4_checksum(&tcp_pkt.to_immutable(), &src, &dst);
+                tcp_pkt.set_checksum(checksum);
+            },
+            AddrPair::Ipv6(src, dst) => {
+                let checksum: u16 = tcp::ipv6_checksum(&tcp_pkt.to_immutable(), &src, &dst);
+                tcp_pkt.set_checksum(checksum);
+            }
+        }
+        Box::new(tcp_pkt.packet().to_vec())
+    }
+
     // Wrap an IP payload with an IP header.
     fn wrap_iphdr(
         src: Ipv4Addr,
@@ -578,32 +603,44 @@ mod tests {
     #[test]
     fn test_v6_to_v4() {
         let clientV4 = Ipv4Addr::new(10, 0, 0, 1);
-        let tests: Vec<PacketTestCase> = vec![PacketTestCase {
-            ipv6: wrap_ip6hdr(
-                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xcafe),
-                Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0x808, 0x808),
-                255,
-                ip::IpNextHeaderProtocols::Icmpv6,
-                &*tmpl_icmpv6(
-                    Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xcafe),
-                    Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0x808, 0x808),
-                    icmpv6::Icmpv6Types::EchoRequest,
-                    icmpv6::ndp::Icmpv6Codes::NoCode,
-                    &vec![0xca, 0xfe, 0xbe, 0xef],
+        let clientV6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xcafe);
+        let targetV4 = Ipv4Addr::new(8, 8, 8, 8);
+        let targetV6 = Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0x808, 0x808);
+        let cafebeef = vec![0xca, 0xfe, 0xbe, 0xef];
+        let tests: Vec<PacketTestCase> = vec![
+            PacketTestCase {
+                ipv6: wrap_ip6hdr(
+                    clientV6,
+                    targetV6,
+                    255,
+                    ip::IpNextHeaderProtocols::Icmpv6,
+                    &*tmpl_icmpv6(
+                        clientV6,
+                        targetV6,
+                        icmpv6::Icmpv6Types::EchoRequest,
+                        icmpv6::ndp::Icmpv6Codes::NoCode,
+                        &cafebeef,
+                    ),
                 ),
-            ),
-            ipv4: wrap_iphdr(
-                clientV4,
-                Ipv4Addr::new(0x8, 0x8, 0x8, 0x8),
-                254,
-                ip::IpNextHeaderProtocols::Icmp,
-                &*tmpl_icmp4(
-                    icmp::IcmpTypes::EchoRequest,
-                    icmp::echo_request::IcmpCodes::NoCode,
-                    &vec![0xca, 0xfe, 0xbe, 0xef],
+                ipv4: wrap_iphdr(
+                    clientV4,
+                    targetV4,
+                    254,
+                    ip::IpNextHeaderProtocols::Icmp,
+                    &*tmpl_icmp4(
+                        icmp::IcmpTypes::EchoRequest,
+                        icmp::echo_request::IcmpCodes::NoCode,
+                        &cafebeef,
+                    ),
                 ),
-            ),
-        }];
+            },
+            PacketTestCase {
+                ipv6: wrap_ip6hdr(clientV6, targetV6, 255, ip::IpNextHeaderProtocols::Tcp,
+                    &*tmpl_tcp(AddrPair::Ipv6(clientV6, targetV6), 42869, 443, &cafebeef)),
+                ipv4: wrap_iphdr(clientV4, targetV4, 254, ip::IpNextHeaderProtocols::Tcp,
+                    &*tmpl_tcp(AddrPair::Ipv4(clientV4, targetV4), 42869, 443, &cafebeef))
+            }
+        ];
         let client_subnet = "10.0.0.0/24";
         for mut test in tests {
             let mut rbuf = [0u8; 1500];
