@@ -13,7 +13,7 @@ use translator::pnet_packet::icmpv6::{
 use translator::pnet_packet::ip::IpNextHeaderProtocol;
 use translator::pnet_packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use translator::pnet_packet::ipv6::MutableIpv6Packet;
-use translator::pnet_packet::MutablePacket;
+use translator::pnet_packet::{MutablePacket, PacketSize};
 use translator::pnet_packet::tcp::{MutableTcpPacket};
 use translator::pnet_packet::{icmp, icmpv6, ip, ipv4, tcp, udp, Packet};
 
@@ -93,10 +93,10 @@ impl HMNat64 {
     pub fn process_v6<'p>(
         &mut self,
         pkt: &mut MutableIpv6Packet,
-        buf: &'p mut [u8],
+        buf: Box<Vec<u8>>,
     ) -> Result<Ipv4Packet<'p>, Xlat6to4Error> {
         let mut response: MutableIpv4Packet<'p> =
-            pnet_packet::ipv4::MutableIpv4Packet::new(buf).ok_or(Xlat6to4Error::BufferTooSmall)?;
+            pnet_packet::ipv4::MutableIpv4Packet::owned(*buf).ok_or(Xlat6to4Error::BufferTooSmall)?;
         let v4src: Ipv4Addr = self
             .get_v4addr_for_host(pkt.get_source())
             .map_err(|e| Xlat6to4Error::Other(e))?;
@@ -118,11 +118,13 @@ impl HMNat64 {
 
         match pkt.get_next_header() {
             ip::IpNextHeaderProtocols::Icmpv6 => {
+                response.set_next_level_protocol(ip::IpNextHeaderProtocols::Icmp);
                 let old_payload = Icmpv6Packet::new(pkt.payload()).unwrap();
-                let new_payload = HMNat64::icmp6_to_icmp4(&old_payload)?;
-                response.set_total_length(20 + new_payload.packet().len() as u16);
-                response.set_payload(&new_payload.packet());
-                response.set_next_level_protocol(ip::IpNextHeaderProtocols::Icmp)
+                let data_offset: usize = 20;
+                println!("data offset is: {}", data_offset);
+                let size = HMNat64::icmp6_to_icmp4(&old_payload, &mut response.packet_mut()[data_offset..])?;
+                println!("size {:?}", size);
+                response.set_total_length(20 + size);
             }
             ip::IpNextHeaderProtocols::Tcp => {
                 let mut tcp_pkt = tcp::MutableTcpPacket::new(pkt.payload_mut()).unwrap();
@@ -172,10 +174,10 @@ impl HMNat64 {
         Ok(response.consume_to_immutable())
     }
 
-    fn icmp6_to_icmp4<'p>(pkt: &Icmpv6Packet) -> Result<IcmpPacket<'p>, Xlat6to4Error> {
-        // XXX setting length via hack, probably reuse some buffer instead of this vodoo.
-        let v = vec![0u8; 4 + pkt.payload().len()];
-        let mut result = MutableIcmpPacket::owned(v).unwrap();
+    // TODO: check if the ICMPv6 packet is too long, that might break the buffer we pass in
+    // because I'm not sure if pnet is handling that somwehere.
+    fn icmp6_to_icmp4(pkt: &Icmpv6Packet, buf: &mut [u8]) -> Result<u16, Xlat6to4Error> {
+        let mut result = MutableIcmpPacket::new(buf).unwrap();
 
         match pkt.get_icmpv6_type() {
             Icmpv6Types::EchoRequest => HMNat64::handle_icmp_echo_request_6to4(pkt, &mut result),
@@ -193,8 +195,8 @@ impl HMNat64 {
 
         let sum = icmp::checksum(&result.to_immutable());
         result.set_checksum(sum);
-
-        Ok(result.consume_to_immutable())
+        // packet_size() returns only the ICMP header length...
+        Ok((result.packet_size() + pkt.payload().len()) as u16)
     }
 
     fn handle_icmp_echo_request_6to4(inpt: &Icmpv6Packet, out: &mut MutableIcmpPacket) {
@@ -520,13 +522,13 @@ mod tests {
         payload: &[u8],
     ) -> Box<Vec<u8>> {
         let buf = vec![0u8; 4 + payload.len()];
-        let mut icmpv6Pkt = MutableIcmpv6Packet::owned(buf).unwrap();
-        icmpv6Pkt.set_icmpv6_type(typ);
-        icmpv6Pkt.set_icmpv6_code(code);
-        icmpv6Pkt.set_payload(payload);
-        let checksum: u16 = icmpv6::checksum(&icmpv6Pkt.to_immutable(), &ipsrc, &ipdst);
-        icmpv6Pkt.set_checksum(checksum);
-        Box::new(icmpv6Pkt.packet().to_vec())
+        let mut icmpv6_pkt = MutableIcmpv6Packet::owned(buf).unwrap();
+        icmpv6_pkt.set_icmpv6_type(typ);
+        icmpv6_pkt.set_icmpv6_code(code);
+        icmpv6_pkt.set_payload(payload);
+        let checksum: u16 = icmpv6::checksum(&icmpv6_pkt.to_immutable(), &ipsrc, &ipdst);
+        icmpv6_pkt.set_checksum(checksum);
+        Box::new(icmpv6_pkt.packet().to_vec())
     }
 
     #[derive(Debug)]
@@ -568,87 +570,69 @@ mod tests {
         payload: &[u8],
     ) -> Box<Vec<u8>> {
         let buf = vec![0u8; 20 + payload.len()];
-        let mut ip4Pkt = MutableIpv4Packet::owned(buf).unwrap();
-        ip4Pkt.set_version(4);
-        ip4Pkt.set_source(src);
-        ip4Pkt.set_destination(dst);
-        ip4Pkt.set_header_length(5);
-        ip4Pkt.set_total_length(20 + payload.len() as u16);
-        ip4Pkt.set_ttl(ttl);
-        ip4Pkt.set_next_level_protocol(next);
-        ip4Pkt.set_payload(payload);
-        let checksum: u16 = ipv4::checksum(&ip4Pkt.to_immutable());
-        ip4Pkt.set_checksum(checksum);
-        Box::new(ip4Pkt.packet().to_vec())
+        let mut ip4_pkt = MutableIpv4Packet::owned(buf).unwrap();
+        ip4_pkt.set_version(4);
+        ip4_pkt.set_source(src);
+        ip4_pkt.set_destination(dst);
+        ip4_pkt.set_header_length(5);
+        ip4_pkt.set_total_length(20 + payload.len() as u16);
+        ip4_pkt.set_ttl(ttl);
+        ip4_pkt.set_next_level_protocol(next);
+        ip4_pkt.set_payload(payload);
+        let checksum: u16 = ipv4::checksum(&ip4_pkt.to_immutable());
+        ip4_pkt.set_checksum(checksum);
+        Box::new(ip4_pkt.packet().to_vec())
     }
 
     fn wrap_ip6hdr(
         src: Ipv6Addr,
         dst: Ipv6Addr,
-        hopLim: u8,
+        hop_lim: u8,
         next: IpNextHeaderProtocol,
         payload: &[u8],
     ) -> Box<Vec<u8>> {
         let buf = vec![0u8; 40 + payload.len()];
-        let mut ip6Pkt = MutableIpv6Packet::owned(buf).unwrap();
-        ip6Pkt.set_source(src);
-        ip6Pkt.set_destination(dst);
-        ip6Pkt.set_hop_limit(hopLim);
-        ip6Pkt.set_next_header(next);
-        ip6Pkt.set_payload_length(payload.len() as u16);
-        ip6Pkt.set_payload(payload);
-        Box::new(ip6Pkt.packet().to_vec())
+        let mut ip6_pkt = MutableIpv6Packet::owned(buf).unwrap();
+        ip6_pkt.set_source(src);
+        ip6_pkt.set_destination(dst);
+        ip6_pkt.set_hop_limit(hop_lim);
+        ip6_pkt.set_next_header(next);
+        ip6_pkt.set_payload_length(payload.len() as u16);
+        ip6_pkt.set_payload(payload);
+        Box::new(ip6_pkt.packet().to_vec())
     }
 
     #[test]
     fn test_v6_to_v4() {
-        let clientV4 = Ipv4Addr::new(10, 0, 0, 1);
-        let clientV6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xcafe);
-        let targetV4 = Ipv4Addr::new(8, 8, 8, 8);
-        let targetV6 = Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0x808, 0x808);
+        let client_v4 = Ipv4Addr::new(10, 0, 0, 1);
+        let client_v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xcafe);
+        let target_v4 = Ipv4Addr::new(8, 8, 8, 8);
+        let target_v6 = Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0x808, 0x808);
         let cafebeef = vec![0xca, 0xfe, 0xbe, 0xef];
         let tests: Vec<PacketTestCase> = vec![
             PacketTestCase {
-                ipv6: wrap_ip6hdr(
-                    clientV6,
-                    targetV6,
-                    255,
-                    ip::IpNextHeaderProtocols::Icmpv6,
-                    &*tmpl_icmpv6(
-                        clientV6,
-                        targetV6,
-                        icmpv6::Icmpv6Types::EchoRequest,
-                        icmpv6::ndp::Icmpv6Codes::NoCode,
-                        &cafebeef,
-                    ),
-                ),
-                ipv4: wrap_iphdr(
-                    clientV4,
-                    targetV4,
-                    254,
-                    ip::IpNextHeaderProtocols::Icmp,
-                    &*tmpl_icmp4(
-                        icmp::IcmpTypes::EchoRequest,
-                        icmp::echo_request::IcmpCodes::NoCode,
-                        &cafebeef,
-                    ),
-                ),
+                ipv6: wrap_ip6hdr(client_v6, target_v6, 255, ip::IpNextHeaderProtocols::Icmpv6,
+                    &*tmpl_icmpv6(client_v6, target_v6, icmpv6::Icmpv6Types::EchoRequest,
+                        icmpv6::ndp::Icmpv6Codes::NoCode, &cafebeef)),
+                ipv4: wrap_iphdr(client_v4, target_v4, 254, ip::IpNextHeaderProtocols::Icmp,
+                    &*tmpl_icmp4(icmp::IcmpTypes::EchoRequest, 
+                        icmp::echo_request::IcmpCodes::NoCode, &cafebeef)),
             },
             PacketTestCase {
-                ipv6: wrap_ip6hdr(clientV6, targetV6, 255, ip::IpNextHeaderProtocols::Tcp,
-                    &*tmpl_tcp(AddrPair::Ipv6(clientV6, targetV6), 42869, 443, &cafebeef)),
-                ipv4: wrap_iphdr(clientV4, targetV4, 254, ip::IpNextHeaderProtocols::Tcp,
-                    &*tmpl_tcp(AddrPair::Ipv4(clientV4, targetV4), 42869, 443, &cafebeef))
+                ipv6: wrap_ip6hdr(client_v6, target_v6, 255, ip::IpNextHeaderProtocols::Tcp,
+                    &*tmpl_tcp(AddrPair::Ipv6(client_v6, target_v6), 42869, 443, &cafebeef)),
+                ipv4: wrap_iphdr(client_v4, target_v4, 254, ip::IpNextHeaderProtocols::Tcp,
+                    &*tmpl_tcp(AddrPair::Ipv4(client_v4, target_v4), 42869, 443, &cafebeef))
             }
         ];
         let client_subnet = "10.0.0.0/24";
         for mut test in tests {
-            let mut rbuf = [0u8; 1500];
+            let mut rbuf = Box::new(vec![0u8; 1500]);
             let mut translator = HMNat64::new("64:ff9b::/96", client_subnet).unwrap();
             let response: Ipv4Packet = translator
                 .process_v6(
                     &mut MutableIpv6Packet::new(&mut *test.ipv6).unwrap(),
-                    &mut rbuf,
+                    rbuf,
                 )
                 .unwrap();
             let lim: usize = response.get_total_length() as usize;

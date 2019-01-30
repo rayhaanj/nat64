@@ -205,9 +205,9 @@ fn main() {
                 continue;
             }
             // FIXME: 1500 byte buffer.
-            let mut buf: [u8; 1500] = [0u8; 1500];
+            let buf = Box::new(vec![0u8; 1500]);
             let out_pkt = match xlator
-                .process_v6(&mut ip6_pkt, &mut buf)
+                .process_v6(&mut ip6_pkt, buf)
                 .map_err(|e| format!("error: {:?}", e))
             {
                 Err(reason) => {
